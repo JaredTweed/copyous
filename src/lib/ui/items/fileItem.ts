@@ -86,6 +86,11 @@ export class FileItem extends ClipboardItem {
 		this._previewUpdateQueued = true;
 		this._previewUpdate ??= this.updateFilePreviewLoop().finally(() => {
 			this._previewUpdate = null;
+			// If an update failed while another settings change arrived, run
+			// the pending request rather than leaving it stranded.
+			if (this._previewUpdateQueued && !this._cancellable.is_cancelled()) {
+				this.updateFilePreview().catch(this.ext.logger.error.bind(this.ext.logger));
+			}
 		});
 		return this._previewUpdate;
 	}
@@ -123,6 +128,8 @@ export class FileItem extends ClipboardItem {
 	}
 
 	private showFilePreview(): boolean {
+		if (this._filePreviewTypes === FilePreviewType.None) return false;
+		if (this._filePreviewExclusionRegex?.test(this.entry.content)) return false;
 		if (
 			this._filePreviewVisibility === FilePreviewVisibility.Hidden ||
 			this._filePreviewVisibility === FilePreviewVisibility.FileInfoOnly
@@ -148,7 +155,7 @@ export class FileItem extends ClipboardItem {
 			}
 		}
 
-		return !this._filePreviewExclusionRegex?.test(this.entry.content);
+		return true;
 	}
 
 	private async configureFilePreview() {
