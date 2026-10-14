@@ -67,8 +67,13 @@ class Actor {
 		this.children.splice(this.children.indexOf(sibling), 0, child);
 		child.parent = this;
 	}
-	add_style_pseudo_class() {}
-	remove_style_pseudo_class() {}
+	pseudoclasses = new Set();
+	add_style_pseudo_class(name) {
+		this.pseudoclasses.add(name);
+	}
+	remove_style_pseudo_class(name) {
+		this.pseudoclasses.delete(name);
+	}
 	has_key_focus() {
 		return false;
 	}
@@ -489,4 +494,35 @@ test('native container destruction destroys detached status actors once and rele
 	attachedStatus.destroy();
 	Actor.prototype.destroy.call(attached);
 	assert.equal(attachedStatus.destroyCalls, 1);
+});
+
+// The dialog initializes its query before asynchronous startup history arrives.
+test('startup insertion finalizes status and edge styling even when search visibility is unchanged', () => {
+	const list = new Container();
+	list._lastQuery = {};
+	assert.equal(list._statusItem.state, State.Empty);
+	const excluded = new Item(1);
+	excluded.search = () => {
+		excluded.visible = false;
+	};
+	list.addItem(excluded);
+	assert.equal(list._statusItem.state, State.NoResults);
+	const first = new Item(2);
+	first.search = () => {};
+	list.addItem(first);
+	assert.equal(list._statusItem.get_parent(), null);
+	assert.deepEqual([...first.pseudoclasses].sort(), ['first-child', 'last-child']);
+	const newest = new Item(3);
+	newest.search = () => {};
+	list.addItem(newest);
+	assert.equal(list._statusItem.get_parent(), null);
+	assert.deepEqual([...newest.pseudoclasses], ['first-child']);
+	assert.deepEqual([...first.pseudoclasses], ['last-child']);
+	list.clearItems();
+	assert.equal(list._statusItem.get_parent(), list);
+	assert.equal(list._statusItem.state, State.Empty);
+	const reloaded = new Item(4);
+	reloaded.search = () => {};
+	list.addItem(reloaded);
+	assert.equal(list._statusItem.get_parent(), null);
 });

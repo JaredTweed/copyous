@@ -197,11 +197,9 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 			else this.add_child(item);
 		}
 
-		if (search && this._lastQuery) {
-			this.updateSearch(item);
-		} else {
-			this.updateVisible();
-		}
+		// Insertion changes the list even when searching leaves this item visible.
+		// Finalize status and edge styling exactly once in either case.
+		if (!search || !this._lastQuery || !this.updateSearch(item)) this.updateVisible();
 	}
 
 	public clearItems(): void {
@@ -312,20 +310,21 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 		}
 	}
 
-	private updateSearch(item: ClipboardItem): void {
-		if (!this._lastQuery) return;
+	private updateSearch(item: ClipboardItem): boolean {
+		if (!this._lastQuery) return false;
 
 		const hasKeyFocus = item.has_key_focus();
 		const wasVisible = item.visible;
 		const first = get_first_visible_child(this) as St.Widget | null;
 		const last = get_last_visible_child(this) as St.Widget | null;
 		item.search(this._lastQuery);
-		if (item.visible === wasVisible) return;
+		if (item.visible === wasVisible) return false;
 		first?.remove_style_pseudo_class('first-child');
 		last?.remove_style_pseudo_class('last-child');
 		this._previewOrder = null;
 		this.updateVisible();
 		if (hasKeyFocus && !item.visible) this.nextFocus(item, false);
+		return true;
 	}
 
 	public prioritizePreviews(): void {

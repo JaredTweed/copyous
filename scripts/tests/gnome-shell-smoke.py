@@ -14,6 +14,23 @@ ext = root / "data/gnome-shell/extensions/copyous@boerdereinar.dev"
 ext.mkdir(parents=True)
 with zipfile.ZipFile("dist/copyous@boerdereinar.dev.zip") as z:
     z.extractall(ext)
+# Instrument only the isolated test artifact: verify the actual native actor tree
+# after startup history is flushed, before each dialog opening.
+dialog = ext / "lib/ui/clipboardDialog.js"
+source = dialog.read_text()
+needle = "this._historyLoader.flush();"
+assert needle in source
+source = source.replace(needle, needle + """
+        {
+            const container = this._scrollView._scrollContainer;
+            const status = container._statusItem;
+            const hasItems = container.get_children().some(child => child !== status && child.visible);
+            if (hasItems && status.get_parent() !== null)
+                throw new Error('Copyous test: empty status displayed alongside history');
+            if (hasItems) console.log('Copyous test: history status invariant passed');
+        }
+""", 1)
+dialog.write_text(source)
 subprocess.run(["glib-compile-schemas", str(ext / "schemas")], check=True)
 public_hljs = (
     pathlib.Path.home() / ".local/share/copyous@boerdereinar.dev/highlight.min.js"
@@ -153,6 +170,8 @@ errors = [
     if re.search(r"Gjs-CRITICAL|GLib-GObject-CRITICAL|JS ERROR:", line)
     and not ("ImportError" in line and "highlight.min.js" in line)
 ]
+if "Copyous test: history status invariant passed" not in shell_log:
+    raise SystemExit("History status invariant was not exercised")
 if process.returncode or errors:
     print("\n".join(errors[:20]) if errors else output[-3000:])
     raise SystemExit("Headless smoke test failed; inspect the printed log directory")
