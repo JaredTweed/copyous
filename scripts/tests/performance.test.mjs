@@ -73,6 +73,7 @@ class Actor {
 		return false;
 	}
 	destroy() {
+		this.destroyCalls = (this.destroyCalls ?? 0) + 1;
 		this.destroyed = true;
 		for (const callback of this.signals.get('destroy') ?? []) callback();
 		this.parent?.remove_child(this);
@@ -172,7 +173,7 @@ test('empty and filtered status survives repeated updates and clearing destroys 
 });
 
 const paramSpec = new Proxy({}, { get: () => () => ({}) });
-function mediaFixture({ successAt = Infinity, throws = false } = {}) {
+function mediaFixture({ successAt = Infinity, throws = false, throwAt = Infinity } = {}) {
 	const timers = new Map();
 	let queryCount = 0;
 	let timerId = 0;
@@ -181,8 +182,9 @@ function mediaFixture({ successAt = Infinity, throws = false } = {}) {
 	const pipeline = {
 		set_state: (state) => states.push(state),
 		query_duration: () => {
-			if (throws) throw new Error('pipeline failed');
-			return [++queryCount >= successAt, 100];
+			queryCount++;
+			if (throws || queryCount === throwAt) throw new Error('pipeline failed');
+			return [queryCount >= successAt, 100];
 		},
 	};
 	const cancellable = {
@@ -210,7 +212,10 @@ function mediaFixture({ successAt = Infinity, throws = false } = {}) {
 					timers.set(++timerId, fn);
 					return timerId;
 				},
-				source_remove: (id) => timers.delete(id),
+				source_remove: (id) => {
+					assert.ok(timers.has(id), 'removed a stale media timer');
+					return timers.delete(id);
+				},
 				SOURCE_REMOVE: false,
 				SOURCE_CONTINUE: true,
 			},
@@ -268,6 +273,14 @@ test('media timeout and pipeline errors always stop the pipeline', async () => {
 });
 
 class Label extends Actor {
+	constructor(props = {}) {
+		super();
+		// GObject assigns custom properties during the parent constructor, before
+		// derived fields and parameter properties have been initialized.
+		for (const key of ['code', 'language', 'syntaxHighlighting', 'showLineNumbers', 'tabWidth']) {
+			if (key in props) this[key] = props[key];
+		}
+	}
 	clutter_text = {
 		set_markup: (text) => {
 			this.markup = text;
@@ -417,4 +430,63 @@ test('native label destruction disconnects callbacks and cancels pending highlig
 	assert.equal(disconnected, 1);
 	assert.equal(themeDisconnected, 1);
 	queue.destroy();
+});
+
+test('media polling exceptions settle the request and stop the pipeline', async () => {
+	const fixture = mediaFixture({ throwAt: 2 });
+	const pending = fixture.run();
+	assert.doesNotThrow(() => fixture.tick());
+	assert.equal(await pending, null);
+	assert.equal(fixture.timers.size, 0);
+	assert.equal(fixture.states.at(-1), 0);
+});
+
+test('cancellation immediately after a successful poll never removes an expired timer', async () => {
+	const fixture = mediaFixture({ successAt: 2 });
+	const pending = fixture.run();
+	fixture.tick();
+	assert.doesNotThrow(() => fixture.cancellable.cancel());
+	assert.equal(await pending, null);
+	assert.equal(fixture.timers.size, 0);
+	assert.equal(fixture.states.at(-1), 0);
+});
+
+test('initial code properties are applied after the GObject parent constructor and do not highlight disabled syntax', () => {
+	const ext = {
+		hljs: {
+			getLanguage: () => null,
+			highlightAuto: () => {
+				throw new Error('highlighting disabled');
+			},
+		},
+		connectHljsInit: () => () => {},
+	};
+	const label = new CodeLabel(ext, {
+		code: '<value & other>',
+		syntaxHighlighting: false,
+		showLineNumbers: false,
+		tabWidth: 8,
+	});
+	assert.equal(label.markup, '\n&lt;value &amp; other&gt;');
+	assert.equal(label.syntaxHighlighting, false);
+	assert.equal(label.showLineNumbers, false);
+	assert.equal(label.tabWidth, 8);
+});
+
+test('native container destruction destroys detached status actors once and releases cached actor references', () => {
+	const list = new Container();
+	const status = list.children[0];
+	const item = new Item(1);
+	list.addItem(item);
+	list._previewOrder = [item];
+	list._foregroundItems.add(item);
+	Actor.prototype.destroy.call(list);
+	assert.equal(status.destroyCalls, 1);
+	assert.equal(list._previewOrder, null);
+	assert.equal(list._foregroundItems.size, 0);
+	const attached = new Container();
+	const attachedStatus = attached.children[0];
+	attachedStatus.destroy();
+	Actor.prototype.destroy.call(attached);
+	assert.equal(attachedStatus.destroyCalls, 1);
 });

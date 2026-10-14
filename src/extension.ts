@@ -44,6 +44,7 @@ export default class CopyousExtension extends Extension {
 
 	private entryTracker: ClipboardEntryTracker | undefined;
 	private historyTimeoutId: number = -1;
+	private historyTimeoutGeneration = 0;
 	private updateHistory: boolean = false;
 
 	public clipboardManager: ClipboardManager | undefined;
@@ -143,11 +144,11 @@ export default class CopyousExtension extends Extension {
 
 		this.settings.connectObject(
 			'changed::database-location',
-			this.initEntryTracker.bind(this),
+			() => this.initEntryTracker().catch(error),
 			'changed::database-backend',
-			this.initEntryTracker.bind(this),
+			() => this.initEntryTracker().catch(error),
 			'changed::history-time',
-			this.initHistoryTimeout.bind(this),
+			() => this.initHistoryTimeout().catch(error),
 			this,
 		);
 
@@ -276,12 +277,16 @@ export default class CopyousExtension extends Extension {
 	private initEntryTracker(): Promise<void> {
 		if (!this.entryTracker?.shouldInit) return Promise.resolve();
 		this.entryTrackerInitQueued = true;
+		return this.startHistoryReload();
+	}
+
+	private startHistoryReload(): Promise<void> {
 		if (!this.entryTrackerInit) {
 			const pending = this.reloadHistory().finally(() => {
 				if (this.entryTrackerInit !== pending) return;
 				this.entryTrackerInit = null;
 				if (this.entryTrackerInitQueued && this.entryTracker) {
-					this.initEntryTracker().catch(this.logger.error.bind(this.logger));
+					this.startHistoryReload().catch(this.logger.error.bind(this.logger));
 				}
 			});
 			this.entryTrackerInit = pending;
@@ -304,12 +309,17 @@ export default class CopyousExtension extends Extension {
 	}
 
 	private async initHistoryTimeout() {
+		const generation = ++this.historyTimeoutGeneration;
 		if (this.historyTimeoutId >= 0) GLib.source_remove(this.historyTimeoutId);
-
-		const historyTime = this.settings?.get_int('history-time');
+		this.historyTimeoutId = -1;
+		const settings = this.settings;
+		const tracker = this.entryTracker;
+		const historyTime = settings?.get_int('history-time');
 		if (historyTime === undefined || historyTime === 0) return;
 
-		await this.entryTracker?.deleteOldest();
+		await tracker?.deleteOldest();
+		if (generation !== this.historyTimeoutGeneration || settings !== this.settings || tracker !== this.entryTracker)
+			return;
 		this.historyTimeoutId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 60, () => {
 			// Do not update the history if the dialog is open
 			this.updateHistory = this.clipboardDialog?.opened ?? false;
@@ -324,6 +334,7 @@ export default class CopyousExtension extends Extension {
 	}
 
 	override disable() {
+		this.historyTimeoutGeneration++;
 		// UI
 		this.entryTrackerInitQueued = false;
 		this.clipboardDialog?.disconnectObject(this);

@@ -16,6 +16,7 @@ import { SearchChange, SearchQuery } from './searchEntry.js';
 @registerClass()
 export class ClipboardScrollContainer extends St.BoxLayout {
 	private readonly _statusItem: StatusItem;
+	private _statusItemDestroyed = false;
 	private _lastFocus: Clutter.Actor | null = null;
 	private _lastQuery: SearchQuery | null = null;
 	private _previewOrder: ClipboardItem[] | null = null;
@@ -29,6 +30,14 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 		});
 
 		this._statusItem = new StatusItem(ext);
+		this._statusItem.connect('destroy', () => {
+			this._statusItemDestroyed = true;
+		});
+		this.connect('destroy', () => {
+			if (!this._statusItemDestroyed) this._statusItem.destroy();
+			this._previewOrder = null;
+			this._foregroundItems.clear();
+		});
 		this.updateVisible();
 	}
 

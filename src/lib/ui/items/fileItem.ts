@@ -107,6 +107,7 @@ export class FileItem extends ClipboardItem {
 	}
 
 	private async configureFile() {
+		if (this._cancellable.is_cancelled()) return;
 		this._filePreviewVisibility = this.fileItemSettings.get_enum('file-preview-visibility');
 		this._filePreviewTypes = this.fileItemSettings.get_flags('file-preview-types');
 		this._filePreviewExclusionPatterns = this.fileItemSettings.get_strv('file-preview-exclusion-patterns');

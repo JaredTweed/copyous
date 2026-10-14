@@ -318,25 +318,32 @@ export async function tryCreateMediaFileInfo(
 			pipeline.set_state(Gst.State.PLAYING);
 			const mediaPipeline = pipeline;
 			let cancellableId = 0;
+			let timeoutId = 0;
 			try {
-				await new Promise<void>((resolve) => {
+				await new Promise<void>((resolve, reject) => {
 					let i = 0;
-					const timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 50, () => {
-						[success, duration] = mediaPipeline.query_duration(Gst.Format.TIME);
-						if (success || i++ >= 5) {
+					timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 50, () => {
+						try {
+							[success, duration] = mediaPipeline.query_duration(Gst.Format.TIME);
+							if (!success && i++ < 5) return GLib.SOURCE_CONTINUE;
+							timeoutId = 0;
 							resolve();
-							return GLib.SOURCE_REMOVE;
+						} catch (error) {
+							timeoutId = 0;
+							reject(error instanceof Error ? error : new Error(String(error)));
 						}
-						return GLib.SOURCE_CONTINUE;
+						return GLib.SOURCE_REMOVE;
 					});
 					cancellableId = cancellable.connect(() => {
-						GLib.source_remove(timeoutId);
+						if (timeoutId) GLib.source_remove(timeoutId);
+						timeoutId = 0;
 						resolve();
 					});
 				});
 			} finally {
 				// Disconnect outside the cancellation handler to avoid deadlocking.
 				if (cancellableId) cancellable.disconnect(cancellableId);
+				if (timeoutId) GLib.source_remove(timeoutId);
 			}
 		}
 

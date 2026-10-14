@@ -224,3 +224,116 @@ test('demoting a queued viewport item releases reserved capacity for the new vie
 	assert.deepEqual(started, ['new', 'old']);
 	await Promise.all([active.promise, oldPage.promise, newPage.promise]);
 });
+
+test('an item error does not strand the rest of an idle history batch', async () => {
+	const main = loop();
+	const consumed = [];
+	const batch = new IdleBatch(
+		main.schedule,
+		() => 0,
+		(entry) => {
+			if (entry === 1) throw new Error('item failed');
+			consumed.push(entry);
+		},
+	);
+	batch.replace([0, 1, 2, 3]);
+	await assert.rejects(main.tick(), /item failed/);
+	assert.equal(main.pending, 1, 'remaining entries must stay scheduled');
+	await main.tick();
+	assert.deepEqual(consumed, [0, 2, 3]);
+	assert.equal(main.pending, 0);
+});
+
+test('a flush error preserves the remaining history and replacement still cancels it', async () => {
+	const main = loop();
+	const consumed = [];
+	const batch = new IdleBatch(
+		main.schedule,
+		() => 0,
+		(entry) => {
+			if (entry === 1) throw new Error('item failed');
+			consumed.push(entry);
+		},
+	);
+	batch.replace([0, 1, 2, 3]);
+	assert.throws(() => batch.flush(), /item failed/);
+	assert.equal(main.pending, 1);
+	batch.replace([10]);
+	await main.tick();
+	assert.deepEqual(consumed, [0, 10]);
+	assert.equal(main.pending, 0);
+});
+
+test('disposing after dispatch but before invocation cannot start fresh work', async () => {
+	const main = loop();
+	const queue = new WorkQueue(main.schedule, 1);
+	let started = false;
+	const job = queue.add(() => {
+		started = true;
+	});
+	const dispatched = main.tick();
+	queue.destroy();
+	await dispatched;
+	assert.equal(await job.promise, undefined);
+	assert.equal(started, false);
+});
+
+test('mixed priority, cancellation and completion sequences preserve queue bounds and settle every job', async () => {
+	let seed = 73;
+	const random = () => {
+		seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+		return seed;
+	};
+	for (let capacity = 1; capacity <= 4; capacity++) {
+		for (let reserve = 0; reserve < capacity; reserve++) {
+			const main = loop();
+			const queue = new WorkQueue(main.schedule, capacity, reserve);
+			const running = new Map();
+			const seen = new Set();
+			let settled = 0;
+			const jobs = Array.from({ length: 100 }, (_, index) => {
+				const job = queue.add(() => {
+					assert.equal(seen.has(index), false, 'a job ran twice');
+					seen.add(index);
+					const wait = deferred();
+					running.set(index, wait);
+					assert.ok(running.size <= capacity, 'concurrency exceeded');
+					return wait.promise.finally(() => running.delete(index));
+				});
+				void job.promise.then(
+					() => settled++,
+					() => settled++,
+				);
+				return job;
+			});
+			for (let i = 0; i < 300; i++) {
+				const job = jobs[random() % jobs.length];
+				switch (random() % 5) {
+					case 0:
+						job.promote();
+						break;
+					case 1:
+						job.demote();
+						break;
+					case 2:
+						job.cancel();
+						break;
+					case 3:
+						running.values().next().value?.resolve();
+						break;
+					case 4:
+						await main.tick();
+						break;
+				}
+			}
+			for (let i = 0; settled < jobs.length && i < 2000; i++) {
+				running.values().next().value?.resolve();
+				await main.tick();
+			}
+			assert.equal(settled, jobs.length, `stranded work at ${capacity}/${reserve}`);
+			assert.equal(running.size, 0);
+			queue.destroy();
+			assert.equal(main.pending, 0);
+		}
+	}
+});

@@ -278,14 +278,20 @@ export class CodeLabel extends St.Label {
 		private ext: CopyousExtension,
 		props: Partial<St.Label.ConstructorProps & CodeLabelConstructorProps>,
 	) {
-		super({ ...props, min_height: 0, clip_to_allocation: true });
+		// GObject applies constructor properties inside super(), before ext and
+		// this class's fields exist. Initialize custom properties only afterwards.
+		const { code, language, syntaxHighlighting, showLineNumbers, tabWidth, ...labelProps } = props;
+		super({ ...labelProps, min_height: 0, clip_to_allocation: true });
 		this.clutter_text.line_wrap_mode = Pango.WrapMode.WORD_CHAR;
 		this.clutter_text.ellipsize = Pango.EllipsizeMode.END;
 
-		const params = {
-			...{ code: '', language: '', syntaxHighlighting: true, showLineNumbers: true, tabWidth: 4 },
-			...props,
-		} as CodeLabelConstructorProps;
+		const params: CodeLabelConstructorProps = {
+			code: code ?? '',
+			language: language ?? null,
+			syntaxHighlighting: syntaxHighlighting ?? true,
+			showLineNumbers: showLineNumbers ?? true,
+			tabWidth: tabWidth ?? 4,
+		};
 		this._code = params.code;
 		this._language = params.language;
 		this._syntaxHighlighting = params.syntaxHighlighting;

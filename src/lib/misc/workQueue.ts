@@ -46,7 +46,7 @@ export class WorkQueue {
 				this.active++;
 				// Keep synchronous throws inside the promise and release the slot on either outcome.
 				void Promise.resolve()
-					.then(work)
+					.then(() => (this.disposed ? undefined : work()))
 					.then(resolve, reject)
 					.finally(() => {
 						this.active--;
@@ -134,13 +134,14 @@ export class IdleBatch<T> {
 			const generation = this.generation;
 			const deadline = this.now() + 4000;
 			let count = 0;
-			while (this.entries && this.index < this.entries.length && generation === this.generation) {
-				this.consume(this.entries[this.index++]!);
-				if (++count >= 32 || this.now() >= deadline) break;
+			try {
+				while (this.entries && this.index < this.entries.length && generation === this.generation) {
+					this.consume(this.entries[this.index++]!);
+					if (++count >= 32 || this.now() >= deadline) break;
+				}
+			} finally {
+				this.continueBatch(generation);
 			}
-			if (generation !== this.generation) return;
-			if (this.entries && this.index === this.entries.length) this.clear();
-			else this.scheduleNext();
 		});
 	}
 
@@ -148,9 +149,18 @@ export class IdleBatch<T> {
 		this.cancelScheduled?.();
 		this.cancelScheduled = null;
 		const generation = this.generation;
-		while (this.entries && this.index < this.entries.length && generation === this.generation)
-			this.consume(this.entries[this.index++]!);
-		if (generation === this.generation) this.clear();
+		try {
+			while (this.entries && this.index < this.entries.length && generation === this.generation)
+				this.consume(this.entries[this.index++]!);
+		} finally {
+			this.continueBatch(generation);
+		}
+	}
+
+	private continueBatch(generation: number): void {
+		if (generation !== this.generation) return;
+		if (this.entries && this.index === this.entries.length) this.clear();
+		else this.scheduleNext();
 	}
 
 	public clear(): void {
