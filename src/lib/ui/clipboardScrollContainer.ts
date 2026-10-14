@@ -6,7 +6,6 @@ import { registerClass } from '../common/gjs.js';
 import {
 	get_first_visible_child,
 	get_last_visible_child,
-	get_n_visible_children,
 	get_next_visible_sibling,
 	get_previous_visible_sibling,
 } from '../misc/actor.js';
@@ -37,18 +36,20 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 	}
 
 	private updateVisible() {
-		const n = get_n_visible_children(this);
-		if (n === 0) {
-			this.add_child(this._statusItem);
+		let hasVisibleItem = false;
+		for (let child = this.get_first_child(); child; child = child.get_next_sibling()) {
+			if (child !== this._statusItem && child.visible) {
+				hasVisibleItem = true;
+				break;
+			}
+		}
+		const statusShown = this._statusItem.get_parent() !== null;
+		if (!hasVisibleItem) {
+			if (!statusShown) this.add_child(this._statusItem);
 			this.x_align = Clutter.ActorAlign.CENTER;
 			this.x_expand = true;
-
-			if (this.get_n_children() === 1) {
-				this._statusItem.state = State.Empty;
-			} else {
-				this._statusItem.state = State.NoResults;
-			}
-		} else if (n >= 2 && this._statusItem.get_parent() !== null) {
+			this._statusItem.state = this.get_n_children() === 1 ? State.Empty : State.NoResults;
+		} else if (statusShown) {
 			this.remove_child(this._statusItem);
 			this.x_align = Clutter.ActorAlign.START;
 			this.x_expand = false;
@@ -166,17 +167,22 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 
 		if (item.get_parent() === this) this.remove_child(item);
 
-		let i = 0;
-		for (const c of this.get_children()) {
-			if (c instanceof ClipboardItem && c.entry.datetime.compare(item.entry.datetime) <= 0) {
-				this.insert_child_at_index(item, i);
-				break;
-			}
-			i++;
-		}
-
-		if (i === this.get_n_children()) {
+		// History arrives in timestamp order. Handle either end without copying
+		// and scanning the entire actor list for every entry.
+		const first = this.get_first_child();
+		const last = this.get_last_child();
+		if (first instanceof ClipboardItem && first.entry.datetime.compare(item.entry.datetime) <= 0) {
+			this.insert_child_below(item, first);
+		} else if (last instanceof ClipboardItem && last.entry.datetime.compare(item.entry.datetime) > 0) {
 			this.add_child(item);
+		} else {
+			let sibling = first;
+			while (sibling) {
+				if (sibling instanceof ClipboardItem && sibling.entry.datetime.compare(item.entry.datetime) <= 0) break;
+				sibling = sibling.get_next_sibling();
+			}
+			if (sibling) this.insert_child_below(item, sibling);
+			else this.add_child(item);
 		}
 
 		if (search && this._lastQuery) {

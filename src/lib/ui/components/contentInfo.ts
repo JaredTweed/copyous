@@ -246,23 +246,29 @@ export class MediaInfo extends FileInfo {
 
 Gio._promisify(Gio.File.prototype, 'enumerate_children_async');
 
-export async function tryCreateDirectoryFileInfo(ext: Extension, file: Gio.File): Promise<DirectoryInfo | null> {
+export async function tryCreateDirectoryFileInfo(
+	ext: Extension,
+	file: Gio.File,
+	cancellable: Gio.Cancellable | null = null,
+): Promise<DirectoryInfo | null> {
 	try {
 		const enumerator = await file.enumerate_children_async(
-			'standard::*',
+			'standard::type',
 			Gio.FileQueryInfoFlags.NONE,
 			GLib.PRIORITY_DEFAULT,
-			null,
+			cancellable,
 		);
 		let directoryCount = 0;
 		let fileCount = 0;
-		for await (const f of enumerator) {
-			const fileType = f.get_file_type();
-			if (fileType === Gio.FileType.DIRECTORY) {
-				directoryCount++;
-			} else if (fileType === Gio.FileType.REGULAR) {
-				fileCount++;
+		try {
+			for await (const f of enumerator) {
+				if (cancellable?.is_cancelled()) return null;
+				const fileType = f.get_file_type();
+				if (fileType === Gio.FileType.DIRECTORY) directoryCount++;
+				else if (fileType === Gio.FileType.REGULAR) fileCount++;
 			}
+		} finally {
+			if (!enumerator.is_closed()) await enumerator.close_async(GLib.PRIORITY_DEFAULT, null);
 		}
 
 		return new DirectoryInfo(ext, directoryCount, fileCount);
@@ -286,49 +292,48 @@ export async function tryCreateMediaFileInfo(
 	size: number,
 	cancellable: Gio.Cancellable,
 ): Promise<MediaInfo | null> {
+	let pipeline: Gst.Element | null = null;
 	try {
-		if (!Gst.is_initialized()) {
-			Gst.init(undefined);
-		}
+		if (cancellable.is_cancelled()) return null;
+		if (!Gst.is_initialized()) Gst.init(undefined);
 
-		// https://gitlab.freedesktop.org/gstreamer/gst-plugins-base/-/blob/ce69d1068af058425b083aaa1b8c268b1b2e5ddd/gst-libs/gst/pbutils/gstdiscoverer.c#L340
-		const pipeline = Gst.parse_launch(`uridecodebin uri="${file.get_uri()}"`);
+		pipeline = Gst.parse_launch(`uridecodebin uri="${file.get_uri()}"`);
 		pipeline.set_state(Gst.State.PAUSED);
-
-		// https://gitlab.freedesktop.org/gstreamer/gst-plugins-base/-/blob/ce69d1068af058425b083aaa1b8c268b1b2e5ddd/gst-libs/gst/pbutils/gstdiscoverer.c#L1417
 		let [success, duration] = pipeline.query_duration(Gst.Format.TIME);
 		if (!success) {
 			pipeline.set_state(Gst.State.PLAYING);
-
-			await new Promise<void>((resolve) => {
-				let i = 0;
-				const timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 50, () => {
-					[success, duration] = pipeline.query_duration(Gst.Format.TIME);
-					if (success || i >= 5) {
+			const mediaPipeline = pipeline;
+			let cancellableId = 0;
+			try {
+				await new Promise<void>((resolve) => {
+					let i = 0;
+					const timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 50, () => {
+						[success, duration] = mediaPipeline.query_duration(Gst.Format.TIME);
+						if (success || i++ >= 5) {
+							resolve();
+							return GLib.SOURCE_REMOVE;
+						}
+						return GLib.SOURCE_CONTINUE;
+					});
+					cancellableId = cancellable.connect(() => {
+						GLib.source_remove(timeoutId);
 						resolve();
-						cancellable.disconnect(cancellableId);
-						return GLib.SOURCE_REMOVE;
-					}
-
-					i++;
-					cancellable.disconnect(cancellableId);
-					return GLib.SOURCE_CONTINUE;
+					});
 				});
-
-				const cancellableId = cancellable.connect(() => GLib.source_remove(timeoutId));
-			});
+			} finally {
+				// Disconnect outside the cancellation handler to avoid deadlocking.
+				if (cancellableId) cancellable.disconnect(cancellableId);
+			}
 		}
 
-		pipeline.set_state(Gst.State.NULL);
-
-		if (success && duration >= 0) {
-			return new MediaInfo(ext, size, duration / (Gst.SECOND as unknown as number));
-		} else {
-			return null;
-		}
+		return !cancellable.is_cancelled() && success && duration >= 0
+			? new MediaInfo(ext, size, duration / (Gst.SECOND as unknown as number))
+			: null;
 	} catch (err) {
-		ext.logger.error(err);
+		if (!cancellable.is_cancelled()) ext.logger.error(err);
 		return null;
+	} finally {
+		pipeline?.set_state(Gst.State.NULL);
 	}
 }
 
@@ -339,7 +344,7 @@ export async function createFileInfo(
 	cancellable: Gio.Cancellable,
 ): Promise<FileInfo> {
 	try {
-		if (!(await fileExists(file))) {
+		if (!(await fileExists(file, cancellable))) {
 			return new MissingFileInfo(ext);
 		}
 
@@ -347,14 +352,14 @@ export async function createFileInfo(
 			Gio.FILE_ATTRIBUTE_STANDARD_SIZE,
 			Gio.FileQueryInfoFlags.NONE,
 			GLib.PRIORITY_DEFAULT,
-			null,
+			cancellable,
 		);
 		const size = info.get_size();
 
 		let fileInfo: FileInfo | null = null;
 		switch (fileType) {
 			case FileType.Directory:
-				fileInfo = await tryCreateDirectoryFileInfo(ext, file);
+				fileInfo = await tryCreateDirectoryFileInfo(ext, file, cancellable);
 				break;
 			case FileType.Image:
 				fileInfo = tryCreateImageInfo(file, size);

@@ -1,0 +1,317 @@
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import test from 'node:test';
+import ts from 'typescript';
+
+// Run the real TypeScript logic with a small actor/GI substitute. Rendering and
+// native signal behavior still require validation inside GNOME Shell.
+function load(path, modules) {
+	const source = readFileSync(new URL(`../../src/${path}`, import.meta.url), 'utf8');
+	const { outputText } = ts.transpileModule(source, {
+		compilerOptions: {
+			module: ts.ModuleKind.CommonJS,
+			target: ts.ScriptTarget.ES2022,
+			experimentalDecorators: true,
+		},
+	});
+	const exports = {};
+	new Function('require', 'exports', outputText)((name) => {
+		assert.ok(name in modules, `Missing mock: ${name}`);
+		const mock = modules[name];
+		return 'default' in mock ? { __esModule: true, ...mock } : mock;
+	}, exports);
+	return exports;
+}
+
+class Actor {
+	children = [];
+	visible = true;
+	parent = null;
+	get_children() {
+		this.copies = (this.copies ?? 0) + 1;
+		return [...this.children];
+	}
+	get_first_child() {
+		return this.children[0] ?? null;
+	}
+	get_last_child() {
+		return this.children.at(-1) ?? null;
+	}
+	get_next_sibling() {
+		return this.parent?.children[this.parent.children.indexOf(this) + 1] ?? null;
+	}
+	get_parent() {
+		return this.parent;
+	}
+	get_n_children() {
+		return this.children.length;
+	}
+	add_child(child) {
+		assert.equal(child.parent, null);
+		this.children.push(child);
+		child.parent = this;
+	}
+	remove_child(child) {
+		this.children.splice(this.children.indexOf(child), 1);
+		child.parent = null;
+	}
+	insert_child_below(child, sibling) {
+		assert.equal(child.parent, null);
+		this.children.splice(this.children.indexOf(sibling), 0, child);
+		child.parent = this;
+	}
+	add_style_pseudo_class() {}
+	remove_style_pseudo_class() {}
+	has_key_focus() {
+		return false;
+	}
+	destroy() {
+		this.destroyed = true;
+		this.parent?.remove_child(this);
+	}
+}
+
+let comparisons = 0;
+class Item extends Actor {
+	constructor(time, id = time) {
+		super();
+		this.id = id;
+		this.time = time;
+		const owner = this;
+		this.entry = {
+			datetime: {
+				compare: (other) => {
+					comparisons++;
+					return this.time - other.value;
+				},
+				get value() {
+					return owner.time;
+				},
+			},
+			connectObject() {},
+		};
+	}
+}
+const State = { Empty: 'empty', NoResults: 'no-results' };
+const { ClipboardScrollContainer: Container } = load('lib/ui/clipboardScrollContainer.ts', {
+	'gi://Clutter': { default: { ActorAlign: { CENTER: 1, START: 2 } } },
+	'gi://St': { default: { BoxLayout: Actor } },
+	'../common/gjs.js': { registerClass: () => (cls) => cls },
+	'../misc/actor.js': {
+		get_first_visible_child: (actor) => actor.children.find((child) => child.visible),
+		get_last_visible_child: (actor) => actor.children.findLast((child) => child.visible),
+	},
+	'./items/clipboardItem.js': { ClipboardItem: Item },
+	'./items/statusItem.js': { State, StatusItem: Actor },
+	'./searchEntry.js': { SearchChange: { Different: 1 } },
+});
+
+test('insertion preserves descending order and newest-first ties after moves', () => {
+	const list = new Container();
+	const expected = [];
+	let seed = 42;
+	for (let i = 0; i < 500; i++) {
+		seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+		const item = new Item(seed % 50, i);
+		const index = expected.findIndex((other) => other.time <= item.time);
+		expected.splice(index < 0 ? expected.length : index, 0, item);
+		list.addItem(item);
+		assert.deepEqual(list.children, expected);
+	}
+	const item = expected.splice(250, 1)[0];
+	const index = expected.findIndex((other) => other.time <= item.time);
+	expected.splice(index < 0 ? expected.length : index, 0, item);
+	list.insertOrMoveItem(item, false);
+	assert.deepEqual(list.children, expected);
+	expected.splice(expected.indexOf(item), 1);
+	item.time = 100;
+	expected.unshift(item);
+	list.insertOrMoveItem(item, false);
+	assert.deepEqual(list.children, expected);
+});
+
+test('ordered history uses linear timestamp comparisons and no actor-list copies', () => {
+	for (const direction of [1, -1]) {
+		comparisons = 0;
+		const list = new Container();
+		for (let i = 0; i < 5000; i++) list.addItem(new Item(i * direction));
+		assert.ok(comparisons <= 10000, `${comparisons} comparisons`);
+		assert.equal(list.copies ?? 0, 0);
+		assert.equal(list.children.length, 5000);
+	}
+});
+
+test('empty and filtered status survives repeated updates and clearing destroys items', () => {
+	const list = new Container();
+	list.updateVisible();
+	assert.equal(list.children.length, 1);
+	assert.equal(list.children[0].state, State.Empty);
+	const item = new Item(1);
+	list.addItem(item);
+	item.visible = false;
+	list.updateVisible();
+	assert.equal(list.children.at(-1).state, State.NoResults);
+	list.clearItems();
+	assert.equal(item.destroyed, true);
+	assert.equal(list.children.length, 1);
+	assert.equal(list.children[0].state, State.Empty);
+});
+
+const paramSpec = new Proxy({}, { get: () => () => ({}) });
+function mediaFixture({ successAt = Infinity, throws = false } = {}) {
+	const timers = new Map();
+	let queryCount = 0;
+	let timerId = 0;
+	let cancelHandler;
+	const states = [];
+	const pipeline = {
+		set_state: (state) => states.push(state),
+		query_duration: () => {
+			if (throws) throw new Error('pipeline failed');
+			return [++queryCount >= successAt, 100];
+		},
+	};
+	const cancellable = {
+		cancelled: false,
+		is_cancelled() {
+			return this.cancelled;
+		},
+		connect(fn) {
+			cancelHandler = fn;
+			return 1;
+		},
+		disconnect() {
+			cancelHandler = null;
+		},
+		cancel() {
+			this.cancelled = true;
+			cancelHandler?.();
+		},
+	};
+	const { tryCreateMediaFileInfo } = load('lib/ui/components/contentInfo.ts', {
+		'gi://Clutter': { default: { ActorAlign: {} } },
+		'gi://GLib': {
+			default: {
+				timeout_add: (_priority, _interval, fn) => {
+					timers.set(++timerId, fn);
+					return timerId;
+				},
+				source_remove: (id) => timers.delete(id),
+				SOURCE_REMOVE: false,
+				SOURCE_CONTINUE: true,
+			},
+		},
+		'gi://GObject': { default: { ParamSpec: paramSpec, ParamFlags: {} } },
+		'gi://GdkPixbuf': { default: {} },
+		'gi://Gio': { default: { _promisify() {}, File: class {} } },
+		'gi://Gst': {
+			default: {
+				is_initialized: () => true,
+				parse_launch: () => pipeline,
+				State: { PAUSED: 1, PLAYING: 2, NULL: 0 },
+				Format: { TIME: 0 },
+			},
+		},
+		'gi://St': { default: { BoxLayout: Actor, Label: Actor } },
+		'resource:///org/gnome/shell/extensions/extension.js': { gettext: (text) => text },
+		'../../common/gjs.js': { registerClass: () => (cls) => cls, enumParamSpec() {} },
+		'../../common/icons.js': {},
+		'../../common/settings.js': { TextCountMode: {} },
+		'./contentPreview.js': {},
+	});
+	return {
+		cancellable,
+		states,
+		timers,
+		run: () =>
+			tryCreateMediaFileInfo({ logger: { error() {} } }, { get_uri: () => 'file:///test' }, 0, cancellable),
+		tick: () => {
+			for (const [id, fn] of timers) if (!fn()) timers.delete(id);
+		},
+	};
+}
+
+test('media cancellation settles work and stops the pipeline, including after a retry', async () => {
+	const fixture = mediaFixture();
+	const pending = fixture.run();
+	fixture.tick();
+	fixture.cancellable.cancel();
+	assert.equal(await pending, null);
+	assert.equal(fixture.timers.size, 0);
+	assert.equal(fixture.states.at(-1), 0);
+});
+
+test('media timeout and pipeline errors always stop the pipeline', async () => {
+	const fixture = mediaFixture();
+	const pending = fixture.run();
+	for (let i = 0; i < 6; i++) fixture.tick();
+	assert.equal(await pending, null);
+	assert.equal(fixture.states.at(-1), 0);
+	assert.equal(fixture.timers.size, 0);
+	const failure = mediaFixture({ throws: true });
+	assert.equal(await failure.run(), null);
+	assert.equal(failure.states.at(-1), 0);
+});
+
+class Label extends Actor {
+	clutter_text = {
+		set_markup: (text) => {
+			this.markup = text;
+		},
+	};
+	notify() {}
+}
+const { CodeLabel, applyTheme } = load('lib/ui/components/codeLabel.ts', {
+	'gi://Clutter': { default: {} },
+	'gi://GLib': {
+		default: {
+			markup_escape_text: (text) => text.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;'),
+		},
+	},
+	'gi://GObject': { default: { ParamSpec: paramSpec, ParamFlags: {} } },
+	'gi://Pango': { default: { WrapMode: {}, EllipsizeMode: {} } },
+	'gi://St': { default: { Label } },
+	'../../common/gjs.js': { registerClass: () => (cls) => cls },
+	'../../common/settings.js': { CustomColorScheme: { Light: 1 } },
+	'./label.js': { normalizeIndentation: (text) => text, trim: (text) => text.trim() },
+});
+
+test('theme changes preserve highlighted markup without running the highlighter again', () => {
+	let highlights = 0;
+	let themeChanged;
+	const raw = '<span class="hljs-keyword">const</span> value = 1;';
+	const ext = {
+		themeManager: {
+			colorScheme: 0,
+			connect: (_signal, callback) => {
+				themeChanged = callback;
+				return 1;
+			},
+			disconnect() {},
+		},
+		hljs: {
+			getLanguage: () => ({ name: 'JavaScript' }),
+			highlight: () => {
+				highlights++;
+				return { value: raw };
+			},
+		},
+		connectHljsInit: () => () => {},
+	};
+	const label = new CodeLabel(ext, {
+		code: 'const value = 1;',
+		language: { id: 'javascript' },
+		showLineNumbers: false,
+	});
+	assert.equal(highlights, 1);
+	for (const scheme of [1, 0, 1]) {
+		ext.themeManager.colorScheme = scheme;
+		themeChanged();
+		assert.equal(label.markup, '\n' + applyTheme(scheme, raw));
+	}
+	assert.equal(highlights, 1);
+	label.syntaxHighlighting = false;
+	label.code = '<value & other>';
+	themeChanged();
+	assert.equal(label.markup, '\n&lt;value &amp; other&gt;');
+});

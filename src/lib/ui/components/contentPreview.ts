@@ -226,9 +226,9 @@ Gio._promisify(Gio.InputStream.prototype, 'close_async');
 Gio._promisify(Gio.FileEnumerator.prototype, 'close_async');
 Gio._promisify(Gio.InputStream.prototype, 'read_bytes_async');
 
-export async function fileExists(file: Gio.File): Promise<boolean> {
+export async function fileExists(file: Gio.File, cancellable: Gio.Cancellable | null = null): Promise<boolean> {
 	try {
-		await file.query_info_async('standard::type', Gio.FileQueryInfoFlags.NONE, GLib.PRIORITY_DEFAULT, null);
+		await file.query_info_async('standard::type', Gio.FileQueryInfoFlags.NONE, GLib.PRIORITY_DEFAULT, cancellable);
 		return true;
 	} catch {
 		return false;
@@ -239,16 +239,21 @@ export async function fileExists(file: Gio.File): Promise<boolean> {
  * Creates a text preview by reading the first 4096 bytes
  * @returns The text preview
  */
-async function createTextPreview(ext: CopyousExtension, file: Gio.File): Promise<TextPreview> {
+async function createTextPreview(
+	ext: CopyousExtension,
+	file: Gio.File,
+	cancellable: Gio.Cancellable | null,
+): Promise<TextPreview> {
 	const extension = file.get_uri().match(/\.(\w+)$/)?.[1];
-	const stream = await file.read_async(GLib.PRIORITY_DEFAULT, null);
+	const stream = await file.read_async(GLib.PRIORITY_DEFAULT, cancellable);
+	let bytes: GLib.Bytes;
 	try {
-		const bytes = await stream.read_bytes_async(4096, GLib.PRIORITY_DEFAULT, null);
-		const text = new TextDecoder().decode(bytes.toArray());
-		return new TextPreview(ext, text, extension);
+		bytes = await stream.read_bytes_async(4096, GLib.PRIORITY_DEFAULT, cancellable);
 	} finally {
 		await stream.close_async(GLib.PRIORITY_DEFAULT, null);
 	}
+	if (cancellable?.is_cancelled()) throw new Error('Preview cancelled');
+	return new TextPreview(ext, new TextDecoder().decode(bytes.toArray()), extension);
 }
 
 /**
@@ -256,17 +261,11 @@ async function createTextPreview(ext: CopyousExtension, file: Gio.File): Promise
  * @param file The file to get the thumbnail for
  * @returns The thumbnail or null if no thumbnail was found
  */
-// Share the asynchronous directory listing across file items. Refresh occasionally
-// so thumbnail-size directories added while the extension runs are discovered.
+// Share only in-flight listings: later requests must see newly created directories.
 let thumbnailDirectoriesPromise: Promise<Gio.File[]> | null = null;
-let thumbnailDirectoriesFetchedAt = 0;
 
 async function getThumbnailDirectories(): Promise<Gio.File[]> {
-	const now = GLib.get_monotonic_time();
-	if (thumbnailDirectoriesPromise && now - thumbnailDirectoriesFetchedAt < 10_000_000)
-		return thumbnailDirectoriesPromise;
-
-	thumbnailDirectoriesFetchedAt = now;
+	if (thumbnailDirectoriesPromise) return thumbnailDirectoriesPromise;
 	thumbnailDirectoriesPromise = (async () => {
 		const root = Gio.File.new_build_filenamev([GLib.get_home_dir(), '.cache', 'thumbnails']);
 		const enumerator = await root.enumerate_children_async(
@@ -278,40 +277,51 @@ async function getThumbnailDirectories(): Promise<Gio.File[]> {
 		const directories: Gio.File[] = [];
 		try {
 			for await (const info of enumerator) {
-				if (info.get_file_type() === Gio.FileType.DIRECTORY)
-					directories.push(root.get_child(info.get_name()));
+				if (info.get_file_type() === Gio.FileType.DIRECTORY) directories.push(root.get_child(info.get_name()));
 			}
 		} finally {
 			if (!enumerator.is_closed()) await enumerator.close_async(GLib.PRIORITY_DEFAULT, null);
 		}
 		return directories;
-	})().catch(() => []);
+	})()
+		.catch(() => [])
+		.finally(() => {
+			thumbnailDirectoriesPromise = null;
+		});
 	return thumbnailDirectoriesPromise;
 }
 
-async function tryGetThumbnail(file: Gio.File): Promise<Gio.File | null> {
+async function tryGetThumbnail(file: Gio.File, cancellable: Gio.Cancellable | null): Promise<Gio.File | null> {
 	const uri = file.get_uri();
 	const md5 = GLib.compute_checksum_for_string(GLib.ChecksumType.MD5, uri, uri.length);
 	for (const directory of await getThumbnailDirectories()) {
 		const thumbnail = directory.get_child(`${md5}.png`);
-		if (await fileExists(thumbnail)) return thumbnail;
+		if (cancellable?.is_cancelled()) return null;
+		// Preserve directory precedence without starting unnecessary file queries.
+		// eslint-disable-next-line no-await-in-loop
+		if (await fileExists(thumbnail, cancellable)) return thumbnail;
 	}
 	return null;
 }
+
 /**
  * Gets the content type of a file
  * @param file The file to guess the content type of
  * @returns The content type or null if no content type was found
  */
-async function getContentType(file: Gio.File, info: Gio.FileInfo): Promise<string | null> {
+async function getContentType(
+	file: Gio.File,
+	info: Gio.FileInfo,
+	cancellable: Gio.Cancellable | null,
+): Promise<string | null> {
 	const contentType = info.get_content_type();
 	if (contentType !== null) return contentType;
 
 	let data: GLib.Bytes;
 	try {
-		const stream = await file.read_async(GLib.PRIORITY_DEFAULT, null);
+		const stream = await file.read_async(GLib.PRIORITY_DEFAULT, cancellable);
 		try {
-			data = await stream.read_bytes_async(64, GLib.PRIORITY_DEFAULT, null);
+			data = await stream.read_bytes_async(64, GLib.PRIORITY_DEFAULT, cancellable);
 		} finally {
 			await stream.close_async(GLib.PRIORITY_DEFAULT, null);
 		}
@@ -332,6 +342,7 @@ async function getContentType(file: Gio.File, info: Gio.FileInfo): Promise<strin
 export async function getFileType(
 	file: Gio.File,
 	fetchThumbnail: boolean = true,
+	cancellable: Gio.Cancellable | null = null,
 ): Promise<[FileType, Gio.File | null]> {
 	let info: Gio.FileInfo;
 	try {
@@ -339,7 +350,7 @@ export async function getFileType(
 			'standard::type,standard::content-type',
 			Gio.FileQueryInfoFlags.NONE,
 			GLib.PRIORITY_DEFAULT,
-			null,
+			cancellable,
 		);
 	} catch {
 		return [FileType.Unknown, null];
@@ -351,14 +362,14 @@ export async function getFileType(
 
 	// Text and image previews do not use the thumbnail. Skip scanning the
 	// thumbnail cache for these common file types.
-	const contentType = await getContentType(file, info);
+	const contentType = await getContentType(file, info, cancellable);
 	if (contentType) {
 		// Image takes precedence because SVG can also be considered text.
 		if (Gio.content_type_is_a(contentType, 'image/*')) return [FileType.Image, null];
 		if (Gio.content_type_is_a(contentType, 'text/plain')) return [FileType.Text, null];
 	}
 
-	const thumbnail = fetchThumbnail ? await tryGetThumbnail(file) : null;
+	const thumbnail = fetchThumbnail ? await tryGetThumbnail(file, cancellable) : null;
 	if (contentType) {
 		if (Gio.content_type_is_a(contentType, 'audio/*')) return [FileType.Audio, thumbnail];
 		if (Gio.content_type_is_a(contentType, 'video/*')) return [FileType.Video, thumbnail];
@@ -379,22 +390,23 @@ export async function tryCreateFilePreview(
 	file: Gio.File,
 	fileType: FileType,
 	thumbnail: Gio.File | null,
+	cancellable: Gio.Cancellable | null = null,
 ): Promise<ContentPreview | null> {
 	const allowedTypes = ext.settings.get_child('file-item').get_flags('file-preview-types');
 
 	try {
-		if (!(await fileExists(file))) return null;
+		if (!(await fileExists(file, cancellable)) || cancellable?.is_cancelled()) return null;
 
 		switch (fileType) {
 			case FileType.Text:
-				return allowedTypes & FilePreviewType.Text ? await createTextPreview(ext, file) : null;
+				return allowedTypes & FilePreviewType.Text ? await createTextPreview(ext, file, cancellable) : null;
 			case FileType.Image:
 				return allowedTypes & FilePreviewType.Image ? new ImagePreview(ext, file) : null;
 		}
 
 		return thumbnail && allowedTypes & FilePreviewType.Thumbnail ? new ThumbnailPreview(ext, file) : null;
 	} catch (error) {
-		ext.logger.error(error);
+		if (!cancellable?.is_cancelled()) ext.logger.error(error);
 		return null;
 	}
 }

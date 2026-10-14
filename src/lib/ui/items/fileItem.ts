@@ -163,13 +163,19 @@ export class FileItem extends ClipboardItem {
 			const file = Gio.File.new_for_uri(this.entry.content);
 			const wantThumbnail = (this._filePreviewTypes & FilePreviewType.Thumbnail) !== 0;
 			if (this._fileType === undefined || (wantThumbnail && this._thumbnail === undefined)) {
-				const [fileType, thumbnail] = await getFileType(file, wantThumbnail);
+				const [fileType, thumbnail] = await getFileType(file, wantThumbnail, this._cancellable);
 				if (this._cancellable.is_cancelled()) return;
 				this._fileType = fileType;
 				if (wantThumbnail) this._thumbnail = thumbnail;
 			}
 
-			this._filePreview = await tryCreateFilePreview(this.ext, file, this._fileType, this._thumbnail ?? null);
+			this._filePreview = await tryCreateFilePreview(
+				this.ext,
+				file,
+				this._fileType,
+				this._thumbnail ?? null,
+				this._cancellable,
+			);
 			if (this._cancellable.is_cancelled()) {
 				this._filePreview?.destroy();
 				return;
@@ -179,13 +185,19 @@ export class FileItem extends ClipboardItem {
 				this.configureVisibility();
 
 				if (this._filePreview instanceof TextPreview) {
-					this.ext.settings.connectObject('changed::tab-width', this.configureFilePreview.bind(this), this);
+					this.ext.settings.connectObject(
+						'changed::tab-width',
+						() => this.updateFilePreview().catch(this.ext.logger.error.bind(this.ext.logger)),
+						this,
+					);
 				} else if (this._filePreview instanceof ImagePreview) {
 					// Hover effect
 					this.bind_property('active', this._filePreview, 'active', GObject.BindingFlags.DEFAULT);
 				}
 			}
-		} else if (this._filePreview !== null) {
+		}
+
+		if (this._filePreview != null) {
 			if (this._filePreview instanceof TextPreview) {
 				this._filePreview.syntaxHighlighting = this.fileItemSettings.get_boolean('syntax-highlighting');
 				this._filePreview.showLineNumbers = this.fileItemSettings.get_boolean('show-line-numbers');
@@ -205,7 +217,7 @@ export class FileItem extends ClipboardItem {
 			const file = Gio.File.new_for_uri(this.entry.content);
 			if (this._fileType === undefined) {
 				// File info never needs the thumbnail; don't enumerate it here.
-				const [fileType] = await getFileType(file, false);
+				const [fileType] = await getFileType(file, false, this._cancellable);
 				if (this._cancellable.is_cancelled()) return;
 				this._fileType = fileType;
 			}

@@ -265,6 +265,7 @@ export class CodeLabel extends St.Label {
 	private readonly _disconnectHljsInit: () => void;
 
 	private _highlighted: string = '';
+	private _highlightedCode: string | null = null;
 
 	// Pango's serial covers wrapping, text, font and context changes.
 	private _lineMetrics: { layout: Pango.Layout; serial: number; offset: number; heights: number[] } | null = null;
@@ -291,7 +292,7 @@ export class CodeLabel extends St.Label {
 		if (this.ext.themeManager) {
 			this._colorSchemeChangedId = this.ext.themeManager?.connect(
 				'notify::color-scheme',
-				this.updateText.bind(this),
+				this.updateTheme.bind(this),
 			);
 		}
 
@@ -369,13 +370,13 @@ export class CodeLabel extends St.Label {
 		if (this._code == null) return;
 
 		// Trim indentation before highlighting to prevent empty lines
-		let text = normalizeIndentation(trim(this._code), this.tabWidth);
+		const text = normalizeIndentation(trim(this._code), this.tabWidth);
 		if (this.syntaxHighlighting && this.ext.hljs != null) {
 			const language =
 				this.language && this.ext.hljs.getLanguage(this.language.id) != null ? this.language.id : null;
 
 			const result = language ? this.ext.hljs.highlight(text, { language }) : this.ext.hljs.highlightAuto(text);
-			text = applyTheme(this.ext.themeManager?.colorScheme, result.value);
+			this._highlightedCode = result.value;
 
 			// Store language
 			if (!language && result.language) {
@@ -386,10 +387,17 @@ export class CodeLabel extends St.Label {
 				this.notify('language');
 			}
 		} else {
-			text = GLib.markup_escape_text(text, text.length);
+			this._highlightedCode = null;
+			this._highlighted = GLib.markup_escape_text(text, text.length);
 		}
 
-		this._highlighted = text;
+		this.updateTheme();
+	}
+
+	private updateTheme() {
+		if (this._highlightedCode !== null) {
+			this._highlighted = applyTheme(this.ext.themeManager?.colorScheme, this._highlightedCode);
+		}
 		this.updateLabel();
 	}
 

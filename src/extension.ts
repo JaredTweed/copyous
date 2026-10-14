@@ -26,7 +26,7 @@ export default class CopyousExtension extends Extension {
 	public hljs: HLJSApi | null | undefined;
 	private hljsMonitor: Gio.FileMonitor | undefined;
 	private hljsLanguages: Map<string, boolean> | undefined;
-	private hljsCallbacks: (() => void)[] | undefined;
+	private hljsCallbacks: Set<() => void> | undefined;
 
 	public themeManager: ThemeManager | undefined;
 
@@ -255,10 +255,10 @@ export default class CopyousExtension extends Extension {
 	public connectHljsInit(fn: () => void): () => void {
 		if (this.hljs != null) return () => {};
 
-		this.hljsCallbacks ??= [];
-		this.hljsCallbacks.push(fn);
+		this.hljsCallbacks ??= new Set();
+		this.hljsCallbacks.add(fn);
 		return () => {
-			this.hljsCallbacks = this.hljsCallbacks?.filter((callback) => callback !== fn);
+			this.hljsCallbacks?.delete(fn);
 		};
 	}
 
