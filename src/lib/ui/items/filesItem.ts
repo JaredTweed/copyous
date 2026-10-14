@@ -99,7 +99,7 @@ export class FilesPreview extends ContentPreview {
 			if (this._moreFiles.visible) this._moreFiles.visible = false;
 
 			// Hide bottom border in the border radius area
-			const radius = this.get_theme_node().get_border_radius(null);
+			const radius = this.get_theme_node().get_border_radius(null!);
 			if (maxHeight - nat <= radius) {
 				borderVisible = false;
 			}
