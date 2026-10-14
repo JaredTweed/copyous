@@ -215,39 +215,48 @@ async function createTextPreview(ext: CopyousExtension, file: Gio.File): Promise
  * @param file The file to get the thumbnail for
  * @returns The thumbnail or null if no thumbnail was found
  */
-async function tryGetThumbnail(file: Gio.File): Promise<Gio.File | null> {
-	const uri = file.get_uri();
-	const md5 = GLib.compute_checksum_for_string(GLib.ChecksumType.MD5, uri, uri.length);
+// Share the asynchronous directory listing across file items. Refresh occasionally
+// so thumbnail-size directories added while the extension runs are discovered.
+let thumbnailDirectoriesPromise: Promise<Gio.File[]> | null = null;
+let thumbnailDirectoriesFetchedAt = 0;
 
-	const homeDir = GLib.get_home_dir();
-	const thumbnailDir = Gio.File.new_build_filenamev([homeDir, '.cache', 'thumbnails']);
+async function getThumbnailDirectories(): Promise<Gio.File[]> {
+	const now = GLib.get_monotonic_time();
+	if (thumbnailDirectoriesPromise && now - thumbnailDirectoriesFetchedAt < 10_000_000)
+		return thumbnailDirectoriesPromise;
 
-	try {
-		// Re-enumerate so directories created later in the session are visible.
-		// All filesystem work stays off the Shell's main thread.
-		const enumerator = await thumbnailDir.enumerate_children_async(
+	thumbnailDirectoriesFetchedAt = now;
+	thumbnailDirectoriesPromise = (async () => {
+		const root = Gio.File.new_build_filenamev([GLib.get_home_dir(), '.cache', 'thumbnails']);
+		const enumerator = await root.enumerate_children_async(
 			'standard::name,standard::type',
 			Gio.FileQueryInfoFlags.NONE,
 			GLib.PRIORITY_DEFAULT,
 			null,
 		);
+		const directories: Gio.File[] = [];
 		try {
 			for await (const info of enumerator) {
-				if (info.get_file_type() !== Gio.FileType.DIRECTORY) continue;
-				const thumbnailFile = thumbnailDir.get_child(info.get_name()).get_child(`${md5}.png`);
-				if (await fileExists(thumbnailFile)) return thumbnailFile;
+				if (info.get_file_type() === Gio.FileType.DIRECTORY)
+					directories.push(root.get_child(info.get_name()));
 			}
 		} finally {
-			// GJS's async iterator normally closes the enumerator itself.
 			if (!enumerator.is_closed()) await enumerator.close_async(GLib.PRIORITY_DEFAULT, null);
 		}
-	} catch {
-		return null;
-	}
-
-	return null;
+		return directories;
+	})().catch(() => []);
+	return thumbnailDirectoriesPromise;
 }
 
+async function tryGetThumbnail(file: Gio.File): Promise<Gio.File | null> {
+	const uri = file.get_uri();
+	const md5 = GLib.compute_checksum_for_string(GLib.ChecksumType.MD5, uri, uri.length);
+	for (const directory of await getThumbnailDirectories()) {
+		const thumbnail = directory.get_child(`${md5}.png`);
+		if (await fileExists(thumbnail)) return thumbnail;
+	}
+	return null;
+}
 /**
  * Gets the content type of a file
  * @param file The file to guess the content type of
@@ -299,19 +308,20 @@ export async function getFileType(
 
 	if (fileType !== Gio.FileType.REGULAR) return [FileType.Unknown, null];
 
-	// First check if the file has thumbnail
-	const thumbnail = fetchThumbnail ? await tryGetThumbnail(file) : null;
-
-	// Then check if the file has any of the allowed types
+	// Text and image previews do not use the thumbnail. Skip scanning the
+	// thumbnail cache for these common file types.
 	const contentType = await getContentType(file, info);
-	if (!contentType) return [FileType.Unknown, thumbnail];
+	if (contentType) {
+		// Image takes precedence because SVG can also be considered text.
+		if (Gio.content_type_is_a(contentType, 'image/*')) return [FileType.Image, null];
+		if (Gio.content_type_is_a(contentType, 'text/plain')) return [FileType.Text, null];
+	}
 
-	// Check image before text since svg is also classified as text/plain
-	if (Gio.content_type_is_a(contentType, 'image/*')) return [FileType.Image, thumbnail];
-	if (Gio.content_type_is_a(contentType, 'audio/*')) return [FileType.Audio, thumbnail];
-	if (Gio.content_type_is_a(contentType, 'video/*')) return [FileType.Video, thumbnail];
-	if (Gio.content_type_is_a(contentType, 'text/plain')) return [FileType.Text, thumbnail];
-
+	const thumbnail = fetchThumbnail ? await tryGetThumbnail(file) : null;
+	if (contentType) {
+		if (Gio.content_type_is_a(contentType, 'audio/*')) return [FileType.Audio, thumbnail];
+		if (Gio.content_type_is_a(contentType, 'video/*')) return [FileType.Video, thumbnail];
+	}
 	return [FileType.Unknown, thumbnail];
 }
 
