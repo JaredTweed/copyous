@@ -121,12 +121,17 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 			adjustment.lower,
 			Math.max(adjustment.lower, adjustment.upper - adjustment.page_size),
 		);
-		adjustment.remove_transition('value');
-		if (value === adjustment.value) return;
+		if (value === adjustment.value) {
+			adjustment.remove_transition('value');
+			return;
+		}
 
 		if (animate) {
+			// Clutter.ease replaces the current transition with the new target.
+			// Do not cancel the existing animation before starting a new one.
 			adjustment.ease(value, { duration: 150, mode: Clutter.AnimationMode.EASE_OUT_QUAD });
 		} else {
+			adjustment.remove_transition('value');
 			adjustment.value = value;
 		}
 	}
