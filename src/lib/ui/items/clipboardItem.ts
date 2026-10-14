@@ -10,6 +10,7 @@ import { MiddleClickAction } from '../../common/settings.js';
 import { ClipboardEntry } from '../../database/database.js';
 import { ButtonMask } from '../../misc/compatibility.js';
 import { Shortcut } from '../../misc/shortcuts.js';
+import { QueuedWork, WorkQueue } from '../../misc/workQueue.js';
 import { HoleEffect } from '../effects/holeEffect.js';
 import { SearchQuery } from '../searchEntry.js';
 import { ClipboardItemHeader } from './clipboardItemHeader.js';
@@ -29,6 +30,8 @@ import { ClipboardItemHeader } from './clipboardItemHeader.js';
 	},
 })
 export class ClipboardItem extends St.Button {
+	private _previewForeground = false;
+	private readonly _previewJobs = new Set<QueuedWork<unknown>>();
 	private _protectPinned: boolean = true;
 	private _protectTagged: boolean = true;
 	private _middleClickAction: MiddleClickAction = MiddleClickAction.None;
@@ -55,6 +58,11 @@ export class ClipboardItem extends St.Button {
 			can_focus: true,
 			width: 300,
 			height: 200,
+		});
+
+		this.connect('destroy', () => {
+			for (const job of this._previewJobs) job.cancel();
+			this._previewJobs.clear();
 		});
 
 		this._box = new St.Widget({
@@ -122,11 +130,38 @@ export class ClipboardItem extends St.Button {
 		this.updateHeader();
 
 		// Connect signals
+		this.connect('key-focus-in', () => this.prioritizePreviews());
 		this.connect('notify::hover', () => this.notify('active'));
 		this.connect('style-changed', () => this.notify('active'));
 		this._header.connect('delete', () => this.forceDelete());
 		this._header.connect('open-menu', (_, x, y, w, h) => this.emit('open-menu', x, y, w, h));
 		this._header.connect('editing-finished', () => this.grab_key_focus());
+	}
+
+	protected queuePreview<T>(queue: WorkQueue, work: () => T | Promise<T>): Promise<T | undefined> {
+		const job = queue.add(work);
+		this._previewJobs.add(job);
+		if (this._previewForeground || this.has_key_focus()) job.promote();
+		return job.promise.finally(() => this._previewJobs.delete(job));
+	}
+
+	public prioritizePreviews(): void {
+		this._previewForeground = true;
+		for (const job of this._previewJobs) job.promote();
+		for (const child of this._content.get_children()) {
+			const preview = child as Clutter.Actor & { prioritizePreviews?: () => void };
+			preview.prioritizePreviews?.();
+		}
+	}
+
+	public deprioritizePreviews(): void {
+		if (this.has_key_focus()) return;
+		this._previewForeground = false;
+		for (const job of this._previewJobs) job.demote();
+		for (const child of this._content.get_children()) {
+			const preview = child as Clutter.Actor & { deprioritizePreviews?: () => void };
+			preview.deprioritizePreviews?.();
+		}
 	}
 
 	get active(): ActiveState {
@@ -305,6 +340,8 @@ export class ClipboardItem extends St.Button {
 	}
 
 	override destroy() {
+		for (const job of this._previewJobs) job.cancel();
+		this._previewJobs.clear();
 		this.ext.settings.disconnectObject(this);
 
 		super.destroy();

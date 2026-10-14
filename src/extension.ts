@@ -13,9 +13,11 @@ import { SoundManager, tryCreateSoundManager } from './lib/common/sound.js';
 import { ClipboardEntry } from './lib/database/database.js';
 import { ClipboardEntryTracker } from './lib/database/entryTracker.js';
 import { ClipboardManager } from './lib/misc/clipboard.js';
+import { scheduleIdle } from './lib/misc/idle.js';
 import { NotificationManager } from './lib/misc/notifications.js';
 import { ShortcutManager } from './lib/misc/shortcuts.js';
 import { ThemeManager } from './lib/misc/theme.js';
+import { WorkQueue } from './lib/misc/workQueue.js';
 import { ClipboardDialog } from './lib/ui/clipboardDialog.js';
 import { ClipboardIndicator } from './lib/ui/indicator.js';
 
@@ -45,12 +47,21 @@ export default class CopyousExtension extends Extension {
 	private updateHistory: boolean = false;
 
 	public clipboardManager: ClipboardManager | undefined;
+	public previewQueue!: WorkQueue;
+	public networkQueue!: WorkQueue;
+	private entryTrackerInit: Promise<void> | null = null;
+	private entryTrackerInitQueued = false;
 
 	override enable() {
 		this.settings = this.getSettings();
 		migrateSettings(this.settings);
 
 		this.logger = this.getLogger();
+		this.entryTrackerInit = null;
+		this.entryTrackerInitQueued = false;
+		// Keep a slot available for visible work; slow network requests cannot block local previews.
+		this.previewQueue = new WorkQueue(scheduleIdle, 4, 1);
+		this.networkQueue = new WorkQueue(scheduleIdle, 3, 1);
 		const error = this.logger.error.bind(this.logger);
 
 		// Highlight.js
@@ -262,13 +273,33 @@ export default class CopyousExtension extends Extension {
 		};
 	}
 
-	private async initEntryTracker() {
-		if (!this.entryTracker || !this.entryTracker.shouldInit) return;
+	private initEntryTracker(): Promise<void> {
+		if (!this.entryTracker?.shouldInit) return Promise.resolve();
+		this.entryTrackerInitQueued = true;
+		if (!this.entryTrackerInit) {
+			const pending = this.reloadHistory().finally(() => {
+				if (this.entryTrackerInit !== pending) return;
+				this.entryTrackerInit = null;
+				if (this.entryTrackerInitQueued && this.entryTracker) {
+					this.initEntryTracker().catch(this.logger.error.bind(this.logger));
+				}
+			});
+			this.entryTrackerInit = pending;
+		}
+		return this.entryTrackerInit;
+	}
 
-		this.clipboardDialog?.clearEntries();
-		const entries = await this.entryTracker.init();
-		for (const entry of entries) {
-			this.clipboardDialog?.addEntry(entry);
+	private async reloadHistory() {
+		while (this.entryTrackerInitQueued) {
+			this.entryTrackerInitQueued = false;
+			const tracker = this.entryTracker;
+			const dialog = this.clipboardDialog;
+			if (!tracker || !dialog) return;
+			dialog.clearEntries();
+			// eslint-disable-next-line no-await-in-loop -- database reloads must not overlap
+			const entries = await tracker.init();
+			if (tracker !== this.entryTracker || dialog !== this.clipboardDialog) return;
+			if (!this.entryTrackerInitQueued) dialog.loadEntries(entries, (entry) => tracker.hasEntry(entry));
 		}
 	}
 
@@ -294,11 +325,14 @@ export default class CopyousExtension extends Extension {
 
 	override disable() {
 		// UI
+		this.entryTrackerInitQueued = false;
 		this.clipboardDialog?.disconnectObject(this);
 		this.clipboardDialog?.destroy();
 		this.indicator?.disconnectObject(this);
 		this.indicator?.destroy();
 		this.clipboardDialog = undefined;
+		this.previewQueue.destroy();
+		this.networkQueue.destroy();
 		this.indicator = undefined;
 
 		// Highlight.js

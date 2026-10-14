@@ -52,6 +52,7 @@ export class FileItem extends ClipboardItem {
 
 	constructor(ext: CopyousExtension, entry: ClipboardEntry) {
 		super(ext, entry, Icon.File, _('File'));
+		this.connect('destroy', () => this._cancellable.cancel());
 
 		this.fileItemSettings = this.ext.settings.get_child('file-item');
 
@@ -101,7 +102,7 @@ export class FileItem extends ClipboardItem {
 		while (this._previewUpdateQueued && !this._cancellable.is_cancelled()) {
 			this._previewUpdateQueued = false;
 			// eslint-disable-next-line no-await-in-loop -- actor creation must finish before another update
-			await this.configureFile();
+			await this.queuePreview(this.ext.previewQueue, () => this.configureFile());
 		}
 	}
 

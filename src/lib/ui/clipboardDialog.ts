@@ -1,4 +1,5 @@
 import Clutter from 'gi://Clutter';
+import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
 import Gio from 'gi://Gio';
 import Graphene from 'gi://Graphene';
@@ -20,7 +21,9 @@ import { Icon, loadIcon } from '../common/icons.js';
 import { OpenClipboardDialogBehavior } from '../common/settings.js';
 import { ClipboardEntry } from '../database/database.js';
 import { VERSION } from '../misc/compatibility.js';
+import { scheduleIdle } from '../misc/idle.js';
 import { Shortcut } from '../misc/shortcuts.js';
+import { IdleBatch } from '../misc/workQueue.js';
 import { ClipboardScrollView } from './clipboardScrollView.js';
 import { ClipboardItemMenu } from './components/clipboardItemMenu.js';
 import { ConfirmClearHistoryDialog } from './indicator.js';
@@ -258,6 +261,16 @@ class ClipboardDialogFooter extends St.BoxLayout {
 	},
 })
 export class ClipboardDialog extends St.Widget {
+	private _historyEntryIsCurrent: ((entry: ClipboardEntry) => boolean) | null = null;
+	private readonly _historyLoader = new IdleBatch<ClipboardEntry>(
+		scheduleIdle,
+		() => GLib.get_monotonic_time(),
+		(entry) => {
+			if (this._historyEntryIsCurrent?.(entry)) this.addEntry(entry);
+		},
+	);
+	private readonly _displayedEntries = new Set<ClipboardEntry>();
+
 	private _grab: Clutter.Grab | null = null;
 	private _open: boolean = false;
 	private _closing: boolean = false;
@@ -403,6 +416,7 @@ export class ClipboardDialog extends St.Widget {
 	}
 
 	override destroy() {
+		this._historyLoader.clear();
 		(Main.inputMethod as Clutter.InputMethod).disconnectObject(this);
 		this._ibusManager.disconnectObject(this);
 		this.ext.settings.disconnectObject(this);
@@ -426,6 +440,9 @@ export class ClipboardDialog extends St.Widget {
 
 	public open() {
 		if (this.opened || this._closing) return;
+
+		// Search, End/Home and scroll bounds must see the complete history on open.
+		this._historyLoader.flush();
 
 		this._updateCursor = false;
 		this._nextCursor = this._cursor;
@@ -540,7 +557,14 @@ export class ClipboardDialog extends St.Widget {
 		});
 	}
 
+	public loadEntries(entries: ClipboardEntry[], isCurrent: (entry: ClipboardEntry) => boolean): void {
+		this._historyEntryIsCurrent = isCurrent;
+		this._historyLoader.replace(entries);
+		if (this.opened) this._historyLoader.flush();
+	}
+
 	public addEntry(entry: ClipboardEntry): void {
+		if (this._displayedEntries.has(entry)) return;
 		let item;
 		try {
 			item = (() => {
@@ -574,6 +598,9 @@ export class ClipboardDialog extends St.Widget {
 			this.ext.logger.error(e);
 			return;
 		}
+
+		this._displayedEntries.add(entry);
+		item.connect('destroy', () => this._displayedEntries.delete(entry));
 
 		// Connect edit
 		item.connectObject('edit', () => this._clipboardItemMenu.edit(entry), this);
@@ -643,6 +670,9 @@ export class ClipboardDialog extends St.Widget {
 	}
 
 	public clearEntries() {
+		this._historyEntryIsCurrent = null;
+		this._historyLoader.clear();
+		this._displayedEntries.clear();
 		this._scrollView.clearItems();
 	}
 

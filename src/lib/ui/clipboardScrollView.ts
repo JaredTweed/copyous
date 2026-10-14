@@ -45,6 +45,15 @@ export class ClipboardScrollView extends St.ScrollView {
 
 		this._scrollContainer = new ClipboardScrollContainer(ext);
 		this.set_child(this._scrollContainer);
+		for (const adjustment of [this.hadjustment, this.vadjustment]) {
+			adjustment.connectObject(
+				'notify::value',
+				() => this._scrollContainer.prioritizePreviews(),
+				'notify::page-size',
+				() => this._scrollContainer.prioritizePreviews(),
+				this,
+			);
+		}
 
 		this.connect('notify::width', this.scrollbarWorkaround.bind(this));
 		this._scrollContainer.connect('notify::width', this.scrollbarWorkaround.bind(this));

@@ -24,6 +24,13 @@ function load(path, modules) {
 }
 
 class Actor {
+	signals = new Map();
+	connect(name, callback) {
+		const callbacks = this.signals.get(name) ?? [];
+		callbacks.push(callback);
+		this.signals.set(name, callbacks);
+		return callbacks.length;
+	}
 	children = [];
 	visible = true;
 	parent = null;
@@ -67,6 +74,7 @@ class Actor {
 	}
 	destroy() {
 		this.destroyed = true;
+		for (const callback of this.signals.get('destroy') ?? []) callback();
 		this.parent?.remove_child(this);
 	}
 }
@@ -94,7 +102,13 @@ class Item extends Actor {
 }
 const State = { Empty: 'empty', NoResults: 'no-results' };
 const { ClipboardScrollContainer: Container } = load('lib/ui/clipboardScrollContainer.ts', {
-	'gi://Clutter': { default: { ActorAlign: { CENTER: 1, START: 2 } } },
+	'gi://Clutter': {
+		default: {
+			ActorAlign: { CENTER: 1, START: 2 },
+			Orientation: { HORIZONTAL: 0, VERTICAL: 1 },
+			TextDirection: { RTL: 1 },
+		},
+	},
 	'gi://St': { default: { BoxLayout: Actor } },
 	'../common/gjs.js': { registerClass: () => (cls) => cls },
 	'../misc/actor.js': {
@@ -314,4 +328,93 @@ test('theme changes preserve highlighted markup without running the highlighter 
 	label.code = '<value & other>';
 	themeChanged();
 	assert.equal(label.markup, '\n&lt;value &amp; other&gt;');
+});
+
+test('viewport priority follows dynamic heights and RTL and reuses the cached item list', () => {
+	for (const [orientation, rtl] of [
+		[0, false],
+		[0, true],
+		[1, false],
+	]) {
+		const list = new Container();
+		const urgent = [];
+		for (let i = 0; i < 100; i++) {
+			const item = new Item(100 - i, i);
+			const start = (i * (i + 1)) / 2;
+			const end = ((i + 1) * (i + 2)) / 2;
+			item.has_allocation = () => true;
+			item.get_allocation_box = () => ({
+				x1: rtl ? 5050 - end : start,
+				x2: rtl ? 5050 - start : end,
+				y1: start,
+				y2: end,
+			});
+			item.prioritizePreviews = () => urgent.push(i);
+			item.deprioritizePreviews = () => {};
+			list.addItem(item);
+		}
+		list.mapped = true;
+		list.orientation = orientation;
+		list.text_direction = rtl ? 1 : 0;
+		list.hadjustment = list.vadjustment = { value: 55, page_size: 12, upper: 5050 };
+		list.prioritizePreviews();
+		assert.deepEqual(urgent, [10, 11]);
+		const copies = list.copies;
+		urgent.length = 0;
+		list.hadjustment.value = 66;
+		list.prioritizePreviews();
+		assert.deepEqual(urgent, [11]);
+		assert.equal(list.copies, copies);
+		list._lastQuery = {};
+		const item = list.children[11];
+		item.search = () => {};
+		list.updateSearch(item);
+		list.prioritizePreviews();
+		assert.equal(list.copies, copies, 'unchanged search results must retain the viewport index');
+	}
+});
+
+test('native label destruction disconnects callbacks and cancels pending highlighting exactly once', async () => {
+	const { WorkQueue } = load('lib/misc/workQueue.ts', {});
+	const callbacks = [];
+	const queue = new WorkQueue((callback) => {
+		callbacks.push(callback);
+		return () => {};
+	}, 1);
+	let initialized;
+	let disconnected = 0;
+	let themeDisconnected = 0;
+	let highlights = 0;
+	const ext = {
+		previewQueue: queue,
+		logger: {
+			error(error) {
+				throw error;
+			},
+		},
+		hljs: null,
+		themeManager: { connect: () => 1, disconnect: () => themeDisconnected++ },
+		connectHljsInit: (callback) => {
+			initialized = callback;
+			return () => disconnected++;
+		},
+	};
+	const label = new CodeLabel(ext, { code: 'sample', showLineNumbers: false });
+	ext.hljs = {
+		getLanguage: () => null,
+		highlightAuto: () => {
+			highlights++;
+			return { value: 'sample' };
+		},
+	};
+	initialized();
+	// Simulate native destruction by a parent; the child's JS destroy override is not called.
+	Actor.prototype.destroy.call(label);
+	label.destroy();
+	for (const callback of callbacks) callback();
+	for (let i = 0; i < 8; i++) await Promise.resolve();
+	assert.equal(highlights, 0);
+	assert.equal(disconnected, 1);
+	assert.equal(themeDisconnected, 1);
+	queue.destroy();
 });

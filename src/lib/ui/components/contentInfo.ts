@@ -277,9 +277,23 @@ export async function tryCreateDirectoryFileInfo(
 	}
 }
 
-export function tryCreateImageInfo(file: Gio.File, size: number): ImageInfo | null {
+export async function tryCreateImageInfo(
+	file: Gio.File,
+	size: number,
+	cancellable: Gio.Cancellable,
+): Promise<ImageInfo | null> {
 	try {
-		const [, width, height] = GdkPixbuf.Pixbuf.get_file_info(file.get_path()!);
+		const [, width, height] = await new Promise<[GdkPixbuf.PixbufFormat | null, number, number]>(
+			(resolve, reject) => {
+				GdkPixbuf.Pixbuf.get_file_info_async(file.get_path()!, cancellable, (_source, result) => {
+					try {
+						resolve(GdkPixbuf.Pixbuf.get_file_info_finish(result));
+					} catch (error) {
+						reject(error instanceof Error ? error : new Error(String(error)));
+					}
+				});
+			},
+		);
 		return new ImageInfo(size, width, height);
 	} catch {
 		return null;
@@ -362,7 +376,7 @@ export async function createFileInfo(
 				fileInfo = await tryCreateDirectoryFileInfo(ext, file, cancellable);
 				break;
 			case FileType.Image:
-				fileInfo = tryCreateImageInfo(file, size);
+				fileInfo = await tryCreateImageInfo(file, size, cancellable);
 				break;
 			case FileType.Audio:
 			case FileType.Video:

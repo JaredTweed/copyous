@@ -8,6 +8,7 @@ import type CopyousExtension from '../../../extension.js';
 import { registerClass } from '../../common/gjs.js';
 import { CustomColorScheme } from '../../common/settings.js';
 import { Language } from '../../database/database.js';
+import { QueuedWork } from '../../misc/workQueue.js';
 import { normalizeIndentation, trim } from './label.js';
 
 // https://gitlab.gnome.org/GNOME/gtksourceview/-/blob/master/data/styles/Adwaita-dark.xml
@@ -255,6 +256,9 @@ export function applyTheme(colorScheme: CustomColorScheme | undefined, highlight
 })
 export class CodeLabel extends St.Label {
 	private readonly _colorSchemeChangedId: number = -1;
+	private _disposed = false;
+	private _previewForeground = false;
+	private _highlightUpdate: QueuedWork<void> | null = null;
 
 	private _code: string = '';
 	private _language: Language | null = null;
@@ -297,17 +301,48 @@ export class CodeLabel extends St.Label {
 		}
 
 		// Update text after hljs is loaded
-		this._disconnectHljsInit = this.ext.connectHljsInit(this.updateText.bind(this));
+		this._disconnectHljsInit = this.ext.connectHljsInit(() => {
+			if (this._disposed) return;
+			this._highlightUpdate?.cancel();
+			const job = this.ext.previewQueue.add(() => {
+				if (!this._disposed) this.updateText();
+			});
+			this._highlightUpdate = job;
+			if (this._previewForeground) job.promote();
+			const logger = this.ext.logger;
+			void job.promise
+				.finally(() => {
+					if (this._highlightUpdate === job) this._highlightUpdate = null;
+				})
+				.catch((error) => logger.error(error));
+		});
+		this.connect('destroy', () => this.dispose());
 
 		this.updateText();
 	}
 
-	override destroy(): void {
+	private dispose(): void {
+		if (this._disposed) return;
+		this._disposed = true;
+		this._highlightUpdate?.cancel();
 		this._disconnectHljsInit();
 		if (this._colorSchemeChangedId >= 0) {
 			this.ext.themeManager?.disconnect(this._colorSchemeChangedId);
 		}
+	}
 
+	public deprioritizePreviews(): void {
+		this._previewForeground = false;
+		this._highlightUpdate?.demote();
+	}
+
+	public prioritizePreviews(): void {
+		this._previewForeground = true;
+		this._highlightUpdate?.promote();
+	}
+
+	override destroy(): void {
+		this.dispose();
 		super.destroy();
 	}
 
@@ -371,7 +406,7 @@ export class CodeLabel extends St.Label {
 
 		// Trim indentation before highlighting to prevent empty lines
 		const text = normalizeIndentation(trim(this._code), this.tabWidth);
-		if (this.syntaxHighlighting && this.ext.hljs != null) {
+		if (text.length > 0 && this.syntaxHighlighting && this.ext.hljs != null) {
 			const language =
 				this.language && this.ext.hljs.getLanguage(this.language.id) != null ? this.language.id : null;
 

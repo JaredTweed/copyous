@@ -12,6 +12,7 @@ import { ActiveState, getCachePath } from '../../common/constants.js';
 import { enumParamSpec, flagsParamSpec, registerClass } from '../../common/gjs.js';
 import { Icon, loadIcon } from '../../common/icons.js';
 import { BackgroundSize, FilePreviewType } from '../../common/settings.js';
+import { QueuedWork } from '../../misc/workQueue.js';
 import { CodeLabel, CodeLabelConstructorProps } from './codeLabel.js';
 
 export const FileType = {
@@ -35,6 +36,20 @@ export class ContentPreview extends St.BoxLayout {
 			y_expand: true,
 		});
 	}
+
+	public prioritizePreviews(): void {
+		for (const child of this.get_children()) {
+			const preview = child as Clutter.Actor & { prioritizePreviews?: () => void };
+			preview.prioritizePreviews?.();
+		}
+	}
+
+	public deprioritizePreviews(): void {
+		for (const child of this.get_children()) {
+			const preview = child as Clutter.Actor & { deprioritizePreviews?: () => void };
+			preview.deprioritizePreviews?.();
+		}
+	}
 }
 
 /**
@@ -46,6 +61,26 @@ export class ContentPreview extends St.BoxLayout {
 const MAX_PREVIEW_EDGE = 4096;
 const PREVIEW_TARGET_EDGE = 1024;
 
+async function ensureDirectory(directory: Gio.File, cancellable: Gio.Cancellable): Promise<void> {
+	try {
+		await directory.make_directory_async(GLib.PRIORITY_DEFAULT, cancellable);
+	} catch (error) {
+		if (error instanceof GLib.Error && error.matches(Gio.io_error_quark(), Gio.IOErrorEnum.EXISTS)) return;
+		if (!(error instanceof GLib.Error) || !error.matches(Gio.io_error_quark(), Gio.IOErrorEnum.NOT_FOUND))
+			throw error;
+		const parent = directory.get_parent();
+		if (!parent) throw error;
+		await ensureDirectory(parent, cancellable);
+		await ensureDirectory(directory, cancellable);
+	}
+}
+
+function getScaledPreviewFile(ext: Extension, image: Gio.File): Gio.File {
+	const uri = image.get_uri();
+	const key = GLib.compute_checksum_for_string(GLib.ChecksumType.MD5, uri, uri.length);
+	return getCachePath(ext).get_child('previews').get_child(`${key}.png`);
+}
+
 /**
  * Gets a file that is safe to use as a preview background-image
  * @param ext The extension
@@ -54,26 +89,60 @@ const PREVIEW_TARGET_EDGE = 1024;
  * @param height The height of the original image
  * @returns The original image if it is small enough, otherwise a cached downscaled copy
  */
-function getSafePreviewFile(ext: Extension, image: Gio.File, width: number, height: number): Gio.File {
+async function getSafePreviewFile(
+	ext: Extension,
+	image: Gio.File,
+	width: number,
+	height: number,
+	cancellable: Gio.Cancellable,
+): Promise<Gio.File> {
 	if (width <= MAX_PREVIEW_EDGE && height <= MAX_PREVIEW_EDGE) return image;
+	const preview = getScaledPreviewFile(ext, image);
+	const previewDir = preview.get_parent()!;
+	if (await fileExists(preview, cancellable)) return preview;
 
-	const uri = image.get_uri();
-	const key = GLib.compute_checksum_for_string(GLib.ChecksumType.MD5, uri, uri.length);
-	const previewDir = getCachePath(ext).get_child('previews');
-	if (!previewDir.query_exists(null)) previewDir.make_directory_with_parents(null);
-
-	const preview = previewDir.get_child(`${key}.png`);
-	if (!preview.query_exists(null)) {
-		const pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(
-			image.get_path()!,
-			PREVIEW_TARGET_EDGE,
-			PREVIEW_TARGET_EDGE,
-			true,
-		);
-		if (!pixbuf.savev(preview.get_path()!, 'png', [], [])) {
-			throw new Error('Failed to save downscaled preview');
-		}
+	const input = await image.read_async(GLib.PRIORITY_DEFAULT, cancellable);
+	let pixbuf: GdkPixbuf.Pixbuf;
+	try {
+		pixbuf = await new Promise<GdkPixbuf.Pixbuf>((resolve, reject) => {
+			GdkPixbuf.Pixbuf.new_from_stream_at_scale_async(
+				input,
+				PREVIEW_TARGET_EDGE,
+				PREVIEW_TARGET_EDGE,
+				true,
+				cancellable,
+				(_source, result) => {
+					try {
+						resolve(GdkPixbuf.Pixbuf.new_from_stream_finish(result));
+					} catch (error) {
+						reject(error instanceof Error ? error : new Error(String(error)));
+					}
+				},
+			);
+		});
+	} finally {
+		await input.close_async(GLib.PRIORITY_DEFAULT, null);
 	}
+	const output = Gio.MemoryOutputStream.new_resizable();
+	try {
+		await new Promise<void>((resolve, reject) => {
+			pixbuf.save_to_streamv_async(output, 'png', [], [], cancellable, (_source, result) => {
+				try {
+					if (!GdkPixbuf.Pixbuf.save_to_stream_finish(result)) throw new Error('Failed to save preview');
+					resolve();
+				} catch (error) {
+					reject(error instanceof Error ? error : new Error(String(error)));
+				}
+			});
+		});
+	} finally {
+		await output.close_async(GLib.PRIORITY_DEFAULT, null);
+	}
+	const data = output.steal_as_bytes().get_data();
+	if (!data) throw new Error('Empty preview');
+	await ensureDirectory(previewDir, cancellable);
+	// Publish only a completely encoded PNG, including when cancellation interrupts encoding.
+	await preview.replace_contents_async(data, null, false, Gio.FileCreateFlags.REPLACE_DESTINATION, cancellable);
 	return preview;
 }
 
@@ -90,38 +159,65 @@ function getSafePreviewFile(ext: Extension, image: Gio.File, width: number, heig
 })
 export class ImagePreview extends ContentPreview {
 	private _backgroundSize: BackgroundSize = BackgroundSize.Cover;
-	private readonly _ratio: number | null;
-	private readonly _effect?: Clutter.BrightnessContrastEffect;
+	private _ratio: number | null = null;
+	private _loading: QueuedWork<Gio.File> | null = null;
+	private readonly _cancellable = new Gio.Cancellable();
+	private _effect: Clutter.BrightnessContrastEffect | undefined;
 
-	constructor(ext: Extension, image: Gio.File) {
+	constructor(ext: CopyousExtension, image: Gio.File) {
 		super();
-
+		this.connect('destroy', () => {
+			this._cancellable.cancel();
+			this._loading?.cancel();
+		});
 		this.add_style_class_name('image-preview');
-
-		if (image.query_exists(null)) {
-			try {
-				const [, width, height] = GdkPixbuf.Pixbuf.get_file_info(image.get_path()!);
-				this._ratio = height / width;
-
-				const previewFile = getSafePreviewFile(ext, image, width, height);
-				const imageBox = new St.Widget({
-					style_class: 'image-box',
-					x_align: Clutter.ActorAlign.FILL,
-					y_align: Clutter.ActorAlign.FILL,
-					x_expand: true,
-					y_expand: true,
-					style: `background-image: url("${previewFile.get_uri()}");`,
-				});
-				this.add_child(imageBox);
-
-				this._effect = new Clutter.BrightnessContrastEffect();
-				imageBox.add_effect(this._effect);
-				return;
-			} catch {
-				// Ignore
+		try {
+			// Preserve the original aspect ratio from the header before layout.
+			// Full image decoding, scaling and PNG encoding run asynchronously.
+			const [format, width, height] = GdkPixbuf.Pixbuf.get_file_info(image.get_path()!);
+			if (!format || width <= 0 || height <= 0) throw new Error('Invalid image');
+			this._ratio = height / width;
+			const imageBox = new St.Widget({
+				style_class: 'image-box',
+				x_align: Clutter.ActorAlign.FILL,
+				y_align: Clutter.ActorAlign.FILL,
+				x_expand: true,
+				y_expand: true,
+			});
+			this.add_child(imageBox);
+			this._effect = new Clutter.BrightnessContrastEffect();
+			imageBox.add_effect(this._effect);
+			if (width <= MAX_PREVIEW_EDGE && height <= MAX_PREVIEW_EDGE) {
+				imageBox.set_style(`background-image: url("${image.get_uri()}");`);
+			} else if (getScaledPreviewFile(ext, image).query_exists(null)) {
+				// Keep cached images immediately available when opening the dialog.
+				imageBox.set_style(`background-image: url("${getScaledPreviewFile(ext, image).get_uri()}");`);
+			} else {
+				this._loading = ext.previewQueue.add(() =>
+					getSafePreviewFile(ext, image, width, height, this._cancellable),
+				);
+				void this._loading.promise
+					.then((preview) => {
+						if (preview && !this._cancellable.is_cancelled())
+							imageBox.set_style(`background-image: url("${preview.get_uri()}");`);
+					})
+					.catch(() => {
+						if (!this._cancellable.is_cancelled()) {
+							imageBox.destroy();
+							this.showMissingImage(ext);
+						}
+					})
+					.finally(() => {
+						this._loading = null;
+					});
 			}
+		} catch {
+			this.showMissingImage(ext);
 		}
+	}
 
+	private showMissingImage(ext: Extension): void {
+		this._effect = undefined;
 		this._ratio = null;
 		this.add_style_class_name('missing-image');
 		this.add_child(
@@ -134,6 +230,20 @@ export class ImagePreview extends ContentPreview {
 				min_height: 0,
 			}),
 		);
+	}
+
+	public override deprioritizePreviews(): void {
+		this._loading?.demote();
+	}
+
+	public override prioritizePreviews(): void {
+		this._loading?.promote();
+	}
+
+	override destroy(): void {
+		this._cancellable.cancel();
+		this._loading?.cancel();
+		super.destroy();
 	}
 
 	get backgroundSize() {
@@ -208,7 +318,13 @@ export class TextPreview extends ContentPreview {
 
 		this.add_style_class_name('text-preview');
 
-		const props: Partial<CodeLabelConstructorProps> = { code: text };
+		const settings = ext.settings.get_child('file-item');
+		const props: Partial<CodeLabelConstructorProps> = {
+			code: text,
+			syntaxHighlighting: settings.get_boolean('syntax-highlighting'),
+			showLineNumbers: settings.get_boolean('show-line-numbers'),
+			tabWidth: ext.settings.get_int('tab-width'),
+		};
 		if (language) props.language = { id: language, name: language };
 		const label = new CodeLabel(ext, props);
 		this.add_child(label);
@@ -222,6 +338,9 @@ export class TextPreview extends ContentPreview {
 Gio._promisify(Gio.File.prototype, 'enumerate_children_async');
 Gio._promisify(Gio.File.prototype, 'read_async');
 Gio._promisify(Gio.File.prototype, 'query_info_async');
+Gio._promisify(Gio.File.prototype, 'make_directory_async');
+Gio._promisify(Gio.File.prototype, 'replace_contents_async');
+Gio._promisify(Gio.OutputStream.prototype, 'close_async');
 Gio._promisify(Gio.InputStream.prototype, 'close_async');
 Gio._promisify(Gio.FileEnumerator.prototype, 'close_async');
 Gio._promisify(Gio.InputStream.prototype, 'read_bytes_async');

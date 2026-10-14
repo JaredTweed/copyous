@@ -18,6 +18,8 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 	private readonly _statusItem: StatusItem;
 	private _lastFocus: Clutter.Actor | null = null;
 	private _lastQuery: SearchQuery | null = null;
+	private _previewOrder: ClipboardItem[] | null = null;
+	private _foregroundItems = new Set<ClipboardItem>();
 
 	constructor(ext: CopyousExtension) {
 		super({
@@ -163,6 +165,7 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 	}
 
 	private insertOrMoveItem(item: ClipboardItem, search: boolean = true): void {
+		this._previewOrder = null;
 		this.removePseudoclasses();
 
 		if (item.get_parent() === this) this.remove_child(item);
@@ -193,6 +196,7 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 	}
 
 	public clearItems(): void {
+		this._previewOrder = null;
 		let focus = false;
 		for (const child of this.get_children()) {
 			if (child instanceof ClipboardItem) {
@@ -200,6 +204,7 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 				child.destroy();
 			}
 		}
+		this._foregroundItems.clear();
 		this._lastFocus = null;
 		this.updateVisible();
 
@@ -210,6 +215,7 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 	}
 
 	public removeItem(child: ClipboardItem): void {
+		this._previewOrder = null;
 		if (child.get_parent() !== this) return;
 
 		const hasKeyFocus = child.has_key_focus();
@@ -218,6 +224,7 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 			newFocus = get_next_visible_sibling(child) ?? get_previous_visible_sibling(child);
 		}
 
+		this._foregroundItems.delete(child);
 		if (this._lastFocus === child) this._lastFocus = null;
 		child.destroy();
 		this.updateVisible();
@@ -270,6 +277,7 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 	}
 
 	public search(query: SearchQuery): void {
+		this._previewOrder = null;
 		// Copy search query, but with SearchChange.Different to always force re-search
 		this._lastQuery = query.withChange(SearchChange.Different);
 
@@ -299,10 +307,60 @@ export class ClipboardScrollContainer extends St.BoxLayout {
 		if (!this._lastQuery) return;
 
 		const hasKeyFocus = item.has_key_focus();
-		this.removePseudoclasses();
+		const wasVisible = item.visible;
+		const first = get_first_visible_child(this) as St.Widget | null;
+		const last = get_last_visible_child(this) as St.Widget | null;
 		item.search(this._lastQuery);
+		if (item.visible === wasVisible) return;
+		first?.remove_style_pseudo_class('first-child');
+		last?.remove_style_pseudo_class('last-child');
+		this._previewOrder = null;
 		this.updateVisible();
 		if (hasKeyFocus && !item.visible) this.nextFocus(item, false);
+	}
+
+	public prioritizePreviews(): void {
+		if (!this.mapped) return;
+		const horizontal = this.orientation === Clutter.Orientation.HORIZONTAL;
+		const adjustment = horizontal ? this.hadjustment : this.vadjustment;
+		if (adjustment.page_size <= 0) return;
+		const reversed = horizontal && this.text_direction === Clutter.TextDirection.RTL;
+		const start = adjustment.value;
+		const end = start + adjustment.page_size;
+		this._previewOrder ??= this.get_children().filter(
+			(child): child is ClipboardItem => child instanceof ClipboardItem && child.visible,
+		);
+		const items = this._previewOrder;
+		// Allocations are monotonic even with dynamic heights. Locate the viewport
+		// in logarithmic time, then visit only the items that intersect it.
+		let lo = 0;
+		let hi = items.length;
+		while (lo < hi) {
+			const mid = (lo + hi) >>> 1;
+			const item = items[mid]!;
+			if (!item.has_allocation()) return;
+			const box = item.get_allocation_box();
+			if ((horizontal ? (reversed ? adjustment.upper - box.x1 : box.x2) : box.y2) <= start) lo = mid + 1;
+			else hi = mid;
+		}
+		const foreground = new Set<ClipboardItem>();
+		for (let i = lo; i < items.length; i++) {
+			const item = items[i]!;
+			if (!item.has_allocation()) break;
+			const box = item.get_allocation_box();
+			if ((horizontal ? (reversed ? adjustment.upper - box.x2 : box.x1) : box.y1) >= end) break;
+			foreground.add(item);
+		}
+		for (const item of this._foregroundItems) {
+			if (!foreground.has(item)) item.deprioritizePreviews();
+		}
+		for (const item of foreground) item.prioritizePreviews();
+		this._foregroundItems = foreground;
+	}
+
+	override vfunc_allocate(box: Clutter.ActorBox): void {
+		super.vfunc_allocate(box);
+		this.prioritizePreviews();
 	}
 
 	public activateFirst(): void {
