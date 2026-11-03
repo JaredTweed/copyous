@@ -51,6 +51,10 @@ export async function run() {
 
 	Scripting.scriptEvent('copyousOpenDone');
 
+	// Release the final modal before terminating the test compositor.
+	extension.clipboardDialog?.close();
+	await Scripting.waitLeisure();
+
 	extension.clipboardDialog?.close();
 	await Scripting.waitLeisure();
 
